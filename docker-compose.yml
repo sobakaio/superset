@@ -1,0 +1,237 @@
+name: superset
+
+x-superset-environment: &superset-environment
+  SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?Set SUPERSET_SECRET_KEY in .env}
+  SUPERSET_METADATA_DB_HOST: postgres
+  SUPERSET_METADATA_DB_PORT: "5432"
+  SUPERSET_METADATA_DB_NAME: ${POSTGRES_DB:-superset}
+  SUPERSET_METADATA_DB_USER: ${POSTGRES_USER:-superset}
+  SUPERSET_METADATA_DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+  ENABLE_PROXY_FIX: ${ENABLE_PROXY_FIX:-true}
+  SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+  SESSION_LIFETIME_HOURS: ${SESSION_LIFETIME_HOURS:-8}
+  SUPERSET_LOG_LEVEL: ${SUPERSET_LOG_LEVEL:-INFO}
+  SERVER_WORKER_AMOUNT: ${SERVER_WORKER_AMOUNT:-2}
+  SERVER_THREADS_AMOUNT: ${SERVER_THREADS_AMOUNT:-20}
+  GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
+  GUNICORN_KEEPALIVE: ${GUNICORN_KEEPALIVE:-5}
+  WORKER_MAX_REQUESTS: ${WORKER_MAX_REQUESTS:-1000}
+  WORKER_MAX_REQUESTS_JITTER: ${WORKER_MAX_REQUESTS_JITTER:-100}
+  CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-2}
+  SUPERSET_PUBLIC_URL: ${SUPERSET_PUBLIC_URL:-http://localhost:8088}
+  ALERT_REPORTS_NOTIFICATION_DRY_RUN: ${ALERT_REPORTS_NOTIFICATION_DRY_RUN:-false}
+  SCREENSHOT_LOCATE_WAIT: ${SCREENSHOT_LOCATE_WAIT:-100}
+  SCREENSHOT_LOAD_WAIT: ${SCREENSHOT_LOAD_WAIT:-600}
+  TZ: ${TZ:-UTC}
+
+x-notification-environment: &notification-environment
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+  SMTP_SSL: ${SMTP_SSL:-false}
+  SMTP_SSL_SERVER_AUTH: ${SMTP_SSL_SERVER_AUTH:-true}
+  SMTP_USER: ${SMTP_USER:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  SMTP_MAIL_FROM: ${SMTP_MAIL_FROM:-superset@example.com}
+  SLACK_API_TOKEN: ${SLACK_API_TOKEN:-}
+
+x-superset-common: &superset-common
+  image: local/apache-superset:6.1.0
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  environment: *superset-environment
+  restart: unless-stopped
+  init: true
+  volumes:
+    - type: bind
+      source: ${DATA_ROOT:-/opt/docker/apache-superset}/superset
+      target: /app/superset_home
+      bind:
+        create_host_path: false
+  networks:
+    - superset
+
+services:
+  postgres:
+    image: postgres:16.15-bookworm
+    restart: unless-stopped
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-superset}
+      POSTGRES_USER: ${POSTGRES_USER:-superset}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/opt/docker/apache-superset}/postgres
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 1m
+    networks:
+      - superset
+
+  redis:
+    image: redis:7.4.11-bookworm
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    command:
+      - /bin/sh
+      - -ec
+      - exec redis-server --appendonly yes --appendfsync everysec --requirepass "$${REDIS_PASSWORD}"
+    volumes:
+      - type: bind
+        source: ${DATA_ROOT:-/opt/docker/apache-superset}/redis
+        target: /data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+    networks:
+      - superset
+
+  superset-init:
+    <<: *superset-common
+    restart: "no"
+    environment:
+      <<: *superset-environment
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_FIRSTNAME: ${ADMIN_FIRSTNAME:-Superset}
+      ADMIN_LASTNAME: ${ADMIN_LASTNAME:-Admin}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        superset db upgrade
+        superset fab create-admin \
+          --username "$${ADMIN_USERNAME}" \
+          --password "$${ADMIN_PASSWORD}" \
+          --firstname "$${ADMIN_FIRSTNAME}" \
+          --lastname "$${ADMIN_LASTNAME}" \
+          --email "$${ADMIN_EMAIL}"
+        superset init
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  superset-web:
+    <<: *superset-common
+    environment:
+      <<: [*superset-environment, *notification-environment]
+    ports:
+      - "${SUPERSET_BIND_ADDRESS:-0.0.0.0}:${SUPERSET_PORT:-8088}:8088"
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8088/health | grep -q OK"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 1m
+
+  superset-worker:
+    <<: *superset-common
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        exec celery --app=superset.tasks.celery_app:app worker
+        --pool=prefork -O fair --loglevel="$${SUPERSET_LOG_LEVEL}"
+        --concurrency="$${CELERY_WORKER_CONCURRENCY}"
+        --queues=default,sql_lab
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - celery --app=superset.tasks.celery_app:app inspect ping -d "celery@$${HOSTNAME}" --timeout=10 | grep -q pong
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 2m
+
+  superset-reports-worker:
+    <<: *superset-common
+    image: local/apache-superset-reports:6.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: reports
+    environment:
+      <<: [*superset-environment, *notification-environment]
+      REPORTS_WORKER_CONCURRENCY: ${REPORTS_WORKER_CONCURRENCY:-1}
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        exec celery --app=superset.tasks.celery_app:app worker
+        --pool=prefork -O fair --loglevel="$${SUPERSET_LOG_LEVEL}"
+        --concurrency="$${REPORTS_WORKER_CONCURRENCY}"
+        --queues=email_reports
+    shm_size: 2gb
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      superset-web:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - celery --app=superset.tasks.celery_app:app inspect ping -d "celery@$${HOSTNAME}" --timeout=10 | grep -q pong
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+    stop_grace_period: 5m
+
+  superset-beat:
+    <<: *superset-common
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        exec celery --app=superset.tasks.celery_app:app beat
+        --pidfile=/tmp/celerybeat.pid
+        --schedule=/app/superset_home/celerybeat-schedule
+        --loglevel="$${SUPERSET_LOG_LEVEL}"
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    stop_grace_period: 1m
+
+networks:
+  superset:
+    driver: bridge

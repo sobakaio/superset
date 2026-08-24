@@ -1,0 +1,205 @@
+import logging
+import os
+from datetime import timedelta
+from urllib.parse import quote
+
+from celery.schedules import crontab
+from flask_caching.backends.rediscache import RedisCache
+from redis import Redis
+from sqlalchemy.engine import URL
+from superset.config import TALISMAN_CONFIG as DEFAULT_TALISMAN_CONFIG
+
+
+def required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Required environment variable {name} is not set")
+    return value
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SECRET_KEY = required_env("SUPERSET_SECRET_KEY")
+
+SQLALCHEMY_DATABASE_URI = URL.create(
+    drivername="postgresql+psycopg2",
+    username=required_env("SUPERSET_METADATA_DB_USER"),
+    password=required_env("SUPERSET_METADATA_DB_PASSWORD"),
+    host=required_env("SUPERSET_METADATA_DB_HOST"),
+    port=int(os.getenv("SUPERSET_METADATA_DB_PORT", "5432")),
+    database=required_env("SUPERSET_METADATA_DB_NAME"),
+).render_as_string(hide_password=False)
+
+SQLALCHEMY_ENGINE_OPTIONS = {
+    "pool_pre_ping": True,
+    "pool_recycle": 300,
+    "pool_size": 5,
+    "max_overflow": 10,
+}
+
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = required_env("REDIS_PASSWORD")
+
+
+def redis_url(db: int) -> str:
+    password = quote(REDIS_PASSWORD, safe="")
+    return f"redis://:{password}@{REDIS_HOST}:{REDIS_PORT}/{db}"
+
+
+def redis_cache(prefix: str, db: int, timeout: int) -> dict:
+    return {
+        "CACHE_TYPE": "RedisCache",
+        "CACHE_DEFAULT_TIMEOUT": timeout,
+        "CACHE_KEY_PREFIX": prefix,
+        "CACHE_REDIS_URL": redis_url(db),
+    }
+
+
+# Keep each workload isolated by Redis database and/or key prefix.
+CACHE_CONFIG = redis_cache("superset_metadata_", 2, 300)
+DATA_CACHE_CONFIG = redis_cache("superset_data_", 2, 300)
+FILTER_STATE_CACHE_CONFIG = redis_cache("superset_filter_", 2, 86400)
+EXPLORE_FORM_DATA_CACHE_CONFIG = redis_cache("superset_explore_", 2, 86400)
+
+RESULTS_BACKEND = RedisCache(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    password=REDIS_PASSWORD,
+    db=1,
+    key_prefix="superset_results_",
+)
+
+DISTRIBUTED_COORDINATION_CONFIG = {
+    "CACHE_TYPE": "RedisCache",
+    "CACHE_REDIS_HOST": REDIS_HOST,
+    "CACHE_REDIS_PORT": REDIS_PORT,
+    "CACHE_REDIS_DB": 4,
+    "CACHE_REDIS_PASSWORD": REDIS_PASSWORD,
+}
+
+
+class CeleryConfig:
+    broker_url = redis_url(0)
+    result_backend = redis_url(1)
+    task_default_queue = "default"
+    imports = (
+        "superset.sql_lab",
+        "superset.tasks.scheduler",
+        "superset.tasks.cache",
+    )
+    worker_prefetch_multiplier = 10
+    task_acks_late = True
+    broker_connection_retry_on_startup = True
+    task_annotations = {
+        "sql_lab.get_sql_results": {
+            "rate_limit": "100/s",
+            "queue": "sql_lab",
+        },
+        "reports.scheduler": {
+            "queue": "email_reports",
+        },
+        "reports.execute": {
+            "queue": "email_reports",
+        },
+        "reports.prune_log": {
+            "queue": "email_reports",
+        },
+    }
+    beat_schedule = {
+        "reports.scheduler": {
+            "task": "reports.scheduler",
+            "schedule": crontab(minute="*", hour="*"),
+        },
+        "reports.prune_log": {
+            "task": "reports.prune_log",
+            "schedule": crontab(minute=0, hour=0),
+        },
+        "prune_query_history": {
+            "task": "prune_query",
+            "schedule": crontab(minute=0, hour=0, day_of_month=1),
+            "kwargs": {"retention_period_days": 180},
+        },
+    }
+
+
+CELERY_CONFIG = CeleryConfig
+
+FEATURE_FLAGS = {
+    "ALERT_REPORTS": True,
+    "ALERT_REPORT_SLACK_V2": True,
+    "ALERT_REPORT_WEBHOOK": True,
+    "DATE_FORMAT_IN_EMAIL_SUBJECT": True,
+    "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": True,
+}
+
+ALERT_REPORTS_NOTIFICATION_DRY_RUN = env_bool(
+    "ALERT_REPORTS_NOTIFICATION_DRY_RUN", False
+)
+ALERT_REPORTS_WEBHOOK_HTTPS_ONLY = True
+
+SCREENSHOT_LOCATE_WAIT = int(os.getenv("SCREENSHOT_LOCATE_WAIT", "100"))
+SCREENSHOT_LOAD_WAIT = int(os.getenv("SCREENSHOT_LOAD_WAIT", "600"))
+
+# The reports worker reaches Superset directly over the Compose network.
+WEBDRIVER_BASEURL = "http://superset-web:8088/"
+WEBDRIVER_BASEURL_USER_FRIENDLY = (
+    os.getenv("SUPERSET_PUBLIC_URL", "http://localhost:8088").rstrip("/") + "/"
+)
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_STARTTLS = env_bool("SMTP_STARTTLS", True)
+SMTP_SSL = env_bool("SMTP_SSL", False)
+SMTP_SSL_SERVER_AUTH = env_bool("SMTP_SSL_SERVER_AUTH", True)
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_MAIL_FROM = os.getenv("SMTP_MAIL_FROM", "superset@example.com")
+EMAIL_REPORTS_SUBJECT_PREFIX = "[Superset] "
+
+SLACK_API_TOKEN = os.getenv("SLACK_API_TOKEN", "")
+
+# Store sessions server-side in Redis; the browser receives only a signed ID.
+SESSION_SERVER_SIDE = True
+SESSION_TYPE = "redis"
+SESSION_REDIS = Redis(
+    host=REDIS_HOST,
+    port=REDIS_PORT,
+    password=REDIS_PASSWORD,
+    db=3,
+)
+SESSION_USE_SIGNER = True
+SESSION_KEY_PREFIX = "superset_session:"
+SESSION_PERMANENT = True
+PERMANENT_SESSION_LIFETIME = timedelta(
+    hours=int(os.getenv("SESSION_LIFETIME_HOURS", "8"))
+)
+SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", True)
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = "Lax"
+
+WTF_CSRF_ENABLED = True
+ENABLE_PROXY_FIX = env_bool("ENABLE_PROXY_FIX", True)
+PREFERRED_URL_SCHEME = "https"
+
+# Keep Superset's CSP/security headers enabled. TLS itself terminates upstream.
+TALISMAN_ENABLED = True
+TALISMAN_CONFIG = {
+    **DEFAULT_TALISMAN_CONFIG,
+    "force_https": False,
+    "session_cookie_secure": SESSION_COOKIE_SECURE,
+}
+
+LOG_LEVEL = getattr(
+    logging,
+    os.getenv("SUPERSET_LOG_LEVEL", "INFO").upper(),
+    logging.INFO,
+)
+
+# PostgreSQL connections to RDS are configured in the Superset UI.
+# The required psycopg2 driver is installed in the custom image.
