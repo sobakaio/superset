@@ -24,6 +24,13 @@ def env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def csv_env(name: str, default: list[str]) -> list[str]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 SECRET_KEY = required_env("SUPERSET_SECRET_KEY")
 
 SQLALCHEMY_DATABASE_URI = URL.create(
@@ -137,6 +144,58 @@ FEATURE_FLAGS = {
     "DATE_FORMAT_IN_EMAIL_SUBJECT": True,
     "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": True,
 }
+
+# MCP is a separate FastMCP process, but it loads this same Superset config.
+# Keep JWT authentication and RBAC enabled by default; disabling either is only
+# appropriate for a short-lived, isolated development test.
+SUPERSET_WEBSERVER_ADDRESS = "http://superset-web:8088"
+MCP_SERVICE_HOST = os.getenv("MCP_SERVICE_HOST", "0.0.0.0")
+MCP_SERVICE_PORT = int(os.getenv("MCP_SERVICE_PORT", "5008"))
+MCP_SERVICE_URL = (
+    os.getenv("MCP_SERVICE_URL", "").strip()
+    or os.getenv("SUPERSET_PUBLIC_URL", "http://localhost:8088").rstrip("/")
+)
+MCP_AUTH_ENABLED = env_bool("MCP_AUTH_ENABLED", True)
+MCP_JWT_ALGORITHM = os.getenv("MCP_JWT_ALGORITHM", "HS256").upper()
+MCP_JWT_SECRET = os.getenv("MCP_JWT_SECRET", "")
+MCP_JWKS_URI = os.getenv("MCP_JWKS_URI", "")
+MCP_JWT_PUBLIC_KEY = os.getenv("MCP_JWT_PUBLIC_KEY", "")
+MCP_JWT_ISSUER = os.getenv("MCP_JWT_ISSUER", "")
+MCP_JWT_AUDIENCE = os.getenv("MCP_JWT_AUDIENCE", "")
+MCP_REQUIRED_SCOPES = csv_env("MCP_REQUIRED_SCOPES", ["superset:mcp"])
+MCP_RBAC_ENABLED = env_bool("MCP_RBAC_ENABLED", True)
+MCP_DEV_USERNAME = None
+MCP_JWT_DEBUG_ERRORS = False
+MCP_SESSION_CONFIG = {
+    "SESSION_COOKIE_HTTPONLY": True,
+    "SESSION_COOKIE_SECURE": env_bool("SESSION_COOKIE_SECURE", True),
+    "SESSION_COOKIE_SAMESITE": "Lax",
+    "SESSION_COOKIE_NAME": "superset_mcp_session",
+    "PERMANENT_SESSION_LIFETIME": int(
+        os.getenv("SESSION_LIFETIME_HOURS", "8")
+    )
+    * 3600,
+}
+MCP_CSRF_CONFIG = {
+    "WTF_CSRF_ENABLED": True,
+    "WTF_CSRF_TIME_LIMIT": None,
+}
+MCP_STORE_CONFIG = {
+    "enabled": True,
+    "CACHE_REDIS_URL": redis_url(int(os.getenv("MCP_STORE_REDIS_DB", "5"))),
+    "event_store_max_events": 100,
+    "event_store_ttl": 3600,
+}
+
+if MCP_AUTH_ENABLED:
+    if MCP_JWT_ALGORITHM not in {"HS256", "RS256"}:
+        raise RuntimeError("MCP_JWT_ALGORITHM must be HS256 or RS256")
+    if MCP_JWT_ALGORITHM == "HS256" and not MCP_JWT_SECRET:
+        raise RuntimeError("MCP_JWT_SECRET is required when MCP uses HS256")
+    if MCP_JWT_ALGORITHM == "RS256" and not (MCP_JWKS_URI or MCP_JWT_PUBLIC_KEY):
+        raise RuntimeError(
+            "MCP_JWKS_URI or MCP_JWT_PUBLIC_KEY is required when MCP uses RS256"
+        )
 
 ALERT_REPORTS_NOTIFICATION_DRY_RUN = env_bool(
     "ALERT_REPORTS_NOTIFICATION_DRY_RUN", False

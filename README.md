@@ -12,12 +12,49 @@ Persistent data is stored in host directories below
 - PostgreSQL metadata database: `16.15-bookworm`
 - Redis: `7.4.11-bookworm`
 - PostgreSQL Python driver: `psycopg2-binary==2.9.9`
+- MCP dependency: `fastmcp==2.13.0.2` (the version used by Superset 6.1.0)
 - Reports browser: Playwright with Chromium
 
 PostgreSQL 16.15 is used because 16.x is the newest PostgreSQL branch listed as
 supported by the Superset 6.1.0 metadata-database documentation. PostgreSQL 18.6
 is the newest upstream PostgreSQL release as of 2026-08-24, but it is not listed
 as supported for Superset 6.1.0 metadata storage.
+
+## AWS host requirements
+
+The baseline AWS host for this single-node deployment is:
+
+- EC2 `m7i.large` — 2 vCPU and 8 GiB RAM;
+- Ubuntu Server 24.04 LTS, amd64;
+- 64 GB EBS `gp3` volume mounted as the root/data filesystem;
+- Docker Engine with Docker Compose v2 and `openssl`.
+
+The 8 GiB profile is suitable for a small or moderate internal BI deployment
+with one reports worker at concurrency 1. The reports container reserves a 2 GiB
+shared-memory segment for Chromium, so monitor RAM and swap pressure before
+increasing `REPORTS_WORKER_CONCURRENCY`, Celery concurrency, or web worker
+counts. Increase the instance size if dashboards, SQL Lab, or reports are
+consistently busy.
+
+The 64 GB volume contains the operating system, Docker image layers, metadata
+PostgreSQL, Redis AOF data, Superset runtime state, and backups. Keep at least
+20% free space; store long-term PostgreSQL backups in encrypted, versioned S3
+storage rather than relying only on the instance disk. The Compose bind mounts
+are under `/opt/docker/apache-superset` as described below.
+
+Recommended security-group rules:
+
+- TCP/22: only from the administrative network or bastion/gateway;
+- TCP/8088: only from the external reverse-proxy host/security group;
+- TCP/5008: only from the reverse-proxy host/security group for MCP;
+- TCP/5432 and TCP/6379: no inbound public access;
+- outbound TCP/5432: allow to the PostgreSQL RDS security group;
+- normal outbound HTTPS/DNS: allow for package/image pulls and integrations.
+
+Do not expose Superset or MCP directly to the internet. TLS terminates on the
+separate reverse proxy; the proxy forwards Superset to port 8088 and MCP to
+`/mcp` on port 5008. If the RDS database is reachable only through a private
+network, place the EC2 host in the appropriate VPC/subnets and security groups.
 
 ## First start
 
@@ -44,7 +81,8 @@ chmod +x init-env.sh
 
 Review `.env`, especially the administrator email and sizing values. The script
 creates cryptographically random values for every secret and sets file mode 600.
-Also set `SUPERSET_PUBLIC_URL` to the HTTPS URL served by the reverse proxy. For
+Also set `SUPERSET_PUBLIC_URL` and `MCP_SERVICE_URL` to the public URLs served by
+the reverse proxy. `MCP_SERVICE_URL` is the public base URL without `/mcp`. For
 email delivery, fill in `SMTP_*`; for Slack delivery, set `SLACK_API_TOKEN`.
 Webhook notifications are enabled and require HTTPS endpoints.
 
@@ -101,6 +139,11 @@ above:
   `REPORTS_WORKER_CONCURRENCY`.
 - Listener and general runtime settings: `SUPERSET_BIND_ADDRESS`,
   `SUPERSET_PORT`, `SESSION_LIFETIME_HOURS`, `SUPERSET_LOG_LEVEL`, and `TZ`.
+- MCP listener and public URL: `MCP_BIND_ADDRESS`, `MCP_PORT`,
+  `MCP_SERVICE_HOST`, `MCP_SERVICE_PORT`, and `MCP_SERVICE_URL`.
+- MCP JWT policy: `MCP_JWT_ISSUER`, `MCP_JWT_AUDIENCE`, and
+  `MCP_REQUIRED_SCOPES`. Keep `MCP_AUTH_ENABLED=true` and
+  `MCP_RBAC_ENABLED=true` in production.
 
 Keep `ENABLE_PROXY_FIX=true` when using the documented reverse-proxy setup and
 keep `SESSION_COOKIE_SECURE=true` for HTTPS. These two values are technically
@@ -163,6 +206,7 @@ set the following values in `.env`:
 ```dotenv
 SESSION_COOKIE_SECURE=false
 SUPERSET_PUBLIC_URL=http://YOUR_SERVER_IP:8088
+MCP_SERVICE_URL=http://YOUR_SERVER_IP:5008
 ```
 
 Replace `YOUR_SERVER_IP` with the address used by the browser, then apply the
@@ -179,6 +223,113 @@ the Superset session cookie over plain HTTP, so login cannot persist.
 Direct HTTP is intended only for local or otherwise trusted testing. After an
 HTTPS reverse proxy is configured, set `SESSION_COOKIE_SECURE=true`, change
 `SUPERSET_PUBLIC_URL` to the public `https://` URL, and recreate the stack again.
+
+## MCP server
+
+The stack includes `superset-mcp` as a separate service, as required by the
+Superset MCP deployment model. It listens on TCP/5008 and exposes the
+Streamable HTTP endpoint at `/mcp`; it does not share the web process on 8088.
+The service uses the same metadata database, Superset secret, Redis instance,
+and RBAC permissions as the web application. Redis database 5 is reserved for
+the MCP event store so sessions, Celery, caches, and MCP events remain isolated.
+
+MCP is built into the custom image with the Superset 6.1-compatible
+`fastmcp==2.13.0.2` pin. Build and start it with the rest of the stack:
+
+```bash
+docker compose config --quiet
+docker compose build --pull
+docker compose up -d
+docker compose ps superset-mcp
+docker compose logs --tail=200 superset-mcp
+```
+
+The Compose healthcheck verifies that the MCP process is listening on its port.
+For an authenticated application-level check, connect an MCP client and call
+the built-in `health_check` tool; the MCP service intentionally has no
+unauthenticated HTTP health endpoint.
+
+### Reverse proxy requirements
+
+Expose only the reverse proxy publicly. Route the public `/mcp` path to
+`http://<docker-host-private-ip>:5008/mcp` and preserve the `Authorization`
+header. The proxy must support long-lived Streamable HTTP connections, disable
+response buffering for this location, and use a generous read timeout (for
+example, 3600 seconds). Restrict inbound TCP/5008 on the Docker host or AWS
+security group to the reverse-proxy host. The MCP URL clients use is the
+public URL, for example `https://superset.example.com/mcp`.
+
+### Authentication and Superset users
+
+JWT authentication is enabled by default. `init-env.sh` generates a random
+`MCP_JWT_SECRET` and stores it only in `.env` (mode 600). The default mode is
+HS256, with issuer `superset-mcp`, audience `superset-mcp`, and required scope
+`superset:mcp`. Every token must contain:
+
+- `sub`: an existing Superset username (not the RDS database username);
+- `iss`: the configured `MCP_JWT_ISSUER`;
+- `aud`: the configured `MCP_JWT_AUDIENCE`;
+- `scope`: including `superset:mcp`;
+- a short-lived `exp`.
+
+Create a dedicated least-privilege Superset service user in the UI and use its
+username as `sub`. Do not use the `admin` account for normal integrations.
+RBAC is enforced by Superset, so the service user can only perform operations
+allowed by its Superset roles.
+
+For an isolated smoke test with the default HS256 setup, the following creates
+a one-hour token without copying the secret out of `.env` (replace the user):
+
+```bash
+docker compose exec -T -e MCP_USER=mcp-service superset-mcp python -c '
+import os, time, jwt
+now = int(time.time())
+claims = {"sub": os.environ["MCP_USER"], "iss": os.environ["MCP_JWT_ISSUER"],
+          "aud": os.environ["MCP_JWT_AUDIENCE"], "scope": "superset:mcp",
+          "iat": now, "exp": now + 3600}
+print(jwt.encode(claims, os.environ["MCP_JWT_SECRET"], algorithm="HS256"))
+'
+```
+
+For a real production deployment with an identity provider, prefer RS256:
+set `MCP_JWT_ALGORITHM=RS256` and configure either `MCP_JWKS_URI` or
+`MCP_JWT_PUBLIC_KEY`. Keep `MCP_AUTH_ENABLED=true`; the documented no-auth
+development mode must not be exposed to a network.
+
+### Existing `.env` migration
+
+If this stack was created before MCP was added, do not delete `.env` and do not
+regenerate the existing Superset, PostgreSQL, Redis, or administrator secrets.
+Add the following values manually, using a new random value for the JWT secret:
+
+```dotenv
+MCP_BIND_ADDRESS=0.0.0.0
+MCP_PORT=5008
+MCP_SERVICE_HOST=0.0.0.0
+MCP_SERVICE_PORT=5008
+MCP_SERVICE_URL=https://superset.example.com
+MCP_AUTH_ENABLED=true
+MCP_JWT_ALGORITHM=HS256
+MCP_JWT_SECRET=<output of: openssl rand -hex 32>
+MCP_JWT_ISSUER=superset-mcp
+MCP_JWT_AUDIENCE=superset-mcp
+MCP_REQUIRED_SCOPES=superset:mcp
+MCP_RBAC_ENABLED=true
+MCP_STORE_REDIS_DB=5
+```
+
+Then rebuild and recreate the stack:
+
+```bash
+chmod 600 .env
+docker compose config --quiet
+docker compose build --pull
+docker compose up -d --force-recreate
+docker compose ps superset-mcp
+```
+
+Changing `MCP_JWT_SECRET`, issuer, audience, or required scopes invalidates
+existing MCP tokens. The Superset account and its RBAC role remain unchanged.
 
 ## Alerts and Reports
 
@@ -256,7 +407,7 @@ View logs:
 
 ```bash
 docker compose logs -f --tail=200 \
-  superset-web superset-worker superset-reports-worker superset-beat
+  superset-web superset-mcp superset-worker superset-reports-worker superset-beat
 ```
 
 Stop without deleting data:
@@ -280,3 +431,5 @@ image tag in both `Dockerfile` and `docker-compose.yml`, rebuild, and let
 - [Superset 6.1.0 caching](https://superset.apache.org/admin-docs/6.1.0/configuration/cache/)
 - [Superset 6.1.0 async queries](https://superset.apache.org/admin-docs/6.1.0/configuration/async-queries-celery/)
 - [Superset production security guide](https://superset.apache.org/admin-docs/6.1.0/security/securing_superset/)
+- [Superset MCP server configuration](https://superset.apache.org/admin-docs/configuration/mcp-server/)
+- [Superset 6.1.0 using AI/MCP](https://superset.apache.org/user-docs/6.1.0/using-superset/using-ai-with-superset/)

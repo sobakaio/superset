@@ -4,7 +4,9 @@ USER root
 
 # Superset 6.1.0 pins this version in its "postgres" optional dependency.
 RUN . /app/.venv/bin/activate && \
-    uv pip install --no-cache-dir "psycopg2-binary==2.9.9"
+    uv pip install --no-cache-dir \
+      "psycopg2-binary==2.9.9" \
+      "fastmcp==2.13.0.2"
 
 COPY --chown=superset:superset superset_config.py /app/superset_config.py
 ENV SUPERSET_CONFIG_PATH=/app/superset_config.py
