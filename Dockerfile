@@ -6,7 +6,7 @@ USER root
 RUN . /app/.venv/bin/activate && \
     uv pip install --no-cache-dir \
       "psycopg2-binary==2.9.9" \
-      "fastmcp==2.13.0.2"
+      "fastmcp==3.1.0"
 
 COPY --chown=superset:superset superset_config.py /app/superset_config.py
 ENV SUPERSET_CONFIG_PATH=/app/superset_config.py

@@ -164,7 +164,9 @@ MCP_JWT_ISSUER = os.getenv("MCP_JWT_ISSUER", "")
 MCP_JWT_AUDIENCE = os.getenv("MCP_JWT_AUDIENCE", "")
 MCP_REQUIRED_SCOPES = csv_env("MCP_REQUIRED_SCOPES", ["superset:mcp"])
 MCP_RBAC_ENABLED = env_bool("MCP_RBAC_ENABLED", True)
-MCP_DEV_USERNAME = None
+# Superset 6.1.0 does not yet resolve the validated JWT subject into g.user.
+# Keep this fixed-user fallback configurable through the uncommitted .env.
+MCP_DEV_USERNAME = os.getenv("MCP_DEV_USERNAME", "").strip() or None
 MCP_JWT_DEBUG_ERRORS = False
 MCP_SESSION_CONFIG = {
     "SESSION_COOKIE_HTTPONLY": True,

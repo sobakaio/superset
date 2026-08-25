@@ -12,7 +12,7 @@ Persistent data is stored in host directories below
 - PostgreSQL metadata database: `16.15-bookworm`
 - Redis: `7.4.11-bookworm`
 - PostgreSQL Python driver: `psycopg2-binary==2.9.9`
-- MCP dependency: `fastmcp==2.13.0.2` (the version used by Superset 6.1.0)
+- MCP dependency: `fastmcp==3.1.0` (the Superset 6.1.0 MCP extra pin)
 - Reports browser: Playwright with Chromium
 
 PostgreSQL 16.15 is used because 16.x is the newest PostgreSQL branch listed as
@@ -107,6 +107,9 @@ curl --fail http://127.0.0.1:8088/health
 
 Expected response: `OK`.
 
+<details>
+<summary>Changing <code>.env</code> after the first start</summary>
+
 ## Changing `.env` after the first start
 
 Changing `.env` does not update the environment of running containers. After a
@@ -181,6 +184,11 @@ new values for `SUPERSET_SECRET_KEY`, `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, and
 `ADMIN_PASSWORD`. Keep the active `.env` in a secure backup together with the
 metadata-database backup.
 
+</details>
+
+<details>
+<summary>External reverse proxy and direct HTTP testing</summary>
+
 ## External reverse proxy
 
 Proxy to `http://<docker-host-private-ip>:8088` and pass at least:
@@ -224,6 +232,8 @@ Direct HTTP is intended only for local or otherwise trusted testing. After an
 HTTPS reverse proxy is configured, set `SESSION_COOKIE_SECURE=true`, change
 `SUPERSET_PUBLIC_URL` to the public `https://` URL, and recreate the stack again.
 
+</details>
+
 ## MCP server
 
 The stack includes `superset-mcp` as a separate service, as required by the
@@ -234,7 +244,7 @@ and RBAC permissions as the web application. Redis database 5 is reserved for
 the MCP event store so sessions, Celery, caches, and MCP events remain isolated.
 
 MCP is built into the custom image with the Superset 6.1-compatible
-`fastmcp==2.13.0.2` pin. Build and start it with the rest of the stack:
+`fastmcp==3.1.0` pin. Build and start it with the rest of the stack:
 
 ```bash
 docker compose config --quiet
@@ -272,16 +282,128 @@ HS256, with issuer `superset-mcp`, audience `superset-mcp`, and required scope
 - `scope`: including `superset:mcp`;
 - a short-lived `exp`.
 
-Create a dedicated least-privilege Superset service user in the UI and use its
-username as `sub`. Do not use the `admin` account for normal integrations.
-RBAC is enforced by Superset, so the service user can only perform operations
-allowed by its Superset roles.
+Create a dedicated least-privilege Superset service user for MCP:
 
-For an isolated smoke test with the default HS256 setup, the following creates
-a one-hour token without copying the secret out of `.env` (replace the user):
+1. Open `Settings -> User Management -> + User` in Superset.
+2. Create a service account, for example `mcp-agent`, with a random password.
+3. Create a custom role named `MCP-Agent` and assign it to the service user.
+4. Run the idempotent command below from the Docker host. It adds the model,
+   SQL Lab, database, and data-access permissions used by the MCP tools without
+   granting user, role, or database-connection administration.
 
 ```bash
-docker compose exec -T -e MCP_USER=mcp-service superset-mcp python -c '
+cd /opt/docker/apache-superset
+
+docker compose exec -T superset-web superset shell <<'PY'
+from superset import db, security_manager
+from superset.models.core import Database
+
+ROLE_NAME = "MCP-Agent"
+DATABASE_NAME = "PostgreSQL"  # Superset connection name, not the RDS DB name
+
+# Permissions used by the MCP chart, dashboard, dataset, database, and SQL tools.
+MODEL_PERMISSIONS = (
+    ("can_read", "Chart"),
+    ("can_write", "Chart"),
+    ("can_read", "Dashboard"),
+    ("can_write", "Dashboard"),
+    ("can_read", "Database"),
+    ("can_read", "Dataset"),
+    ("can_write", "Dataset"),
+    ("can_read", "SavedQuery"),
+    ("can_write", "SavedQuery"),
+    ("can_read", "SQLLab"),
+    ("can_write", "SQLLab"),
+    ("can_execute_sql_query", "SQLLab"),
+)
+
+role = security_manager.find_role(ROLE_NAME)
+if role is None:
+    raise RuntimeError(
+        f"Role {ROLE_NAME!r} does not exist. Create it in Superset first."
+    )
+
+database = (
+    db.session.query(Database)
+    .filter(Database.database_name == DATABASE_NAME)
+    .one_or_none()
+)
+if database is None:
+    raise RuntimeError(
+        f"Superset database connection {DATABASE_NAME!r} was not found."
+    )
+
+def grant(permission_name, view_name):
+    permission_view = security_manager.find_permission_view_menu(
+        permission_name, view_name
+    )
+    if permission_view is None:
+        permission_view = security_manager.add_permission_view_menu(
+            permission_name, view_name
+        )
+    if permission_view not in role.permissions:
+        security_manager.add_permission_role(role, permission_view)
+        print(f"Granted: {permission_name} on {view_name}")
+    else:
+        print(f"Already present: {permission_name} on {view_name}")
+
+for permission_name, view_name in MODEL_PERMISSIONS:
+    grant(permission_name, view_name)
+
+# Grants access to all current and future datasets belonging to this connection.
+grant("database_access", database.perm)
+
+db.session.commit()
+print(f"Role ready: {role.name}; database access: {database.database_name}")
+PY
+```
+
+The command is safe to run repeatedly. It does not remove existing permissions.
+`DATABASE_NAME` is the Superset connection name shown under **Settings →
+Database Connections**; it is not the PostgreSQL/RDS database name such as
+`kaktus_rds`. The `database_access` permission covers the connection's datasets,
+so individual `datasource_access` entries are not required for this setup.
+If the service user currently also has `Gamma`, remove `Gamma` after verifying
+the MCP workflow so the account retains only the intended custom role.
+
+The MCP tools bundled with Superset 6.1.0 do not expose Alert/Report creation
+tools. Enabling Alerts and Reports in the stack does not add those tools to MCP;
+their separate UI/API permissions should only be added if that workflow is
+explicitly enabled.
+
+Use the exact service username as the JWT `sub` claim. Do not use the `admin`
+account or the RDS database username. RBAC is enforced by Superset, so the
+service user can only perform operations allowed by its Superset roles.
+
+#### Superset 6.1.0 fixed-user workaround
+
+The upstream 6.1.0 MCP implementation validates the JWT but does not yet
+resolve its `sub` claim into the Superset `g.user` context. For a single MCP
+agent, set the existing least-privilege username in `.env`:
+
+```dotenv
+MCP_DEV_USERNAME=mcp-agent
+```
+
+This keeps JWT authentication and RBAC enabled, but all authenticated MCP
+calls execute as that one configured Superset user. It is suitable for one
+service account only; do not use it for multiple independent users. After
+changing it, rebuild and recreate only the MCP service:
+
+```bash
+docker compose build superset-mcp
+docker compose up -d --force-recreate superset-mcp
+```
+
+Remove `MCP_DEV_USERNAME` when moving to a Superset version with JWT-to-user
+resolution, so the JWT `sub` claim can identify each user independently.
+
+Generate a one-hour JWT on the Docker host. Run this from the stack directory;
+the command reads `MCP_JWT_SECRET` inside the container and never prints it:
+
+```bash
+cd /opt/docker/apache-superset
+docker compose exec -T -e MCP_USER=mcp-agent superset-mcp python -c '
 import os, time, jwt
 now = int(time.time())
 claims = {"sub": os.environ["MCP_USER"], "iss": os.environ["MCP_JWT_ISSUER"],
@@ -291,10 +413,18 @@ print(jwt.encode(claims, os.environ["MCP_JWT_SECRET"], algorithm="HS256"))
 '
 ```
 
+Copy the resulting token to the MCP client as a bearer token. No container
+rebuild or restart is required after creating the Superset user or generating
+the token. Generate a new token after it expires; changing the JWT secret,
+issuer, audience, or required scopes invalidates existing tokens.
+
 For a real production deployment with an identity provider, prefer RS256:
 set `MCP_JWT_ALGORITHM=RS256` and configure either `MCP_JWKS_URI` or
 `MCP_JWT_PUBLIC_KEY`. Keep `MCP_AUTH_ENABLED=true`; the documented no-auth
 development mode must not be exposed to a network.
+
+<details>
+<summary>Existing <code>.env</code> migration after MCP was added</summary>
 
 ### Existing `.env` migration
 
@@ -331,6 +461,11 @@ docker compose ps superset-mcp
 Changing `MCP_JWT_SECRET`, issuer, audience, or required scopes invalidates
 existing MCP tokens. The Superset account and its RBAC role remain unchanged.
 
+</details>
+
+<details>
+<summary>Alerts and Reports</summary>
+
 ## Alerts and Reports
 
 Alerts and Reports are enabled at startup, with notification dry-run disabled.
@@ -356,6 +491,8 @@ CPU/RAM intensive. Increase `REPORTS_WORKER_CONCURRENCY` only after observing
 actual resource usage. PNG/PDF screenshots may take up to the configured
 `SCREENSHOT_LOAD_WAIT`.
 
+</details>
+
 ## Connect the PostgreSQL RDS source
 
 1. Give the Docker host network access to the RDS endpoint on TCP/5432.
@@ -376,6 +513,9 @@ stack's `.env` file.
 
 For long SQL Lab queries, enable **Asynchronous Query Execution** in that database
 connection after verifying the Celery worker is healthy.
+
+<details>
+<summary>Persistence and backup</summary>
 
 ## Persistence and backup
 
@@ -401,6 +541,11 @@ docker compose exec -T postgres sh -c \
 Copy backups off the EC2 instance, preferably to a versioned and encrypted S3
 bucket. Also configure EBS snapshots. Test restores periodically.
 
+</details>
+
+<details>
+<summary>Operations and upgrades</summary>
+
 ## Operations
 
 View logs:
@@ -423,6 +568,11 @@ Before upgrading, back up PostgreSQL, read the Superset `UPDATING.md`, pin the n
 image tag in both `Dockerfile` and `docker-compose.yml`, rebuild, and let
 `superset-init` run `superset db upgrade` and `superset init`.
 
+</details>
+
+<details>
+<summary>Official references</summary>
+
 ## Official references
 
 - [Superset 6.1.0 installation methods](https://superset.apache.org/admin-docs/6.1.0/installation/installation-methods/)
@@ -433,3 +583,5 @@ image tag in both `Dockerfile` and `docker-compose.yml`, rebuild, and let
 - [Superset production security guide](https://superset.apache.org/admin-docs/6.1.0/security/securing_superset/)
 - [Superset MCP server configuration](https://superset.apache.org/admin-docs/configuration/mcp-server/)
 - [Superset 6.1.0 using AI/MCP](https://superset.apache.org/user-docs/6.1.0/using-superset/using-ai-with-superset/)
+
+</details>
