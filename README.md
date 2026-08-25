@@ -363,6 +363,11 @@ The command is safe to run repeatedly. It does not remove existing permissions.
 Database Connections**; it is not the PostgreSQL/RDS database name such as
 `kaktus_rds`. The `database_access` permission covers the connection's datasets,
 so individual `datasource_access` entries are not required for this setup.
+`can_write` on `Dataset` changes only Superset metadata: it allows the MCP user
+to create or edit virtual-dataset definitions. It does not grant `INSERT`,
+`UPDATE`, `DELETE`, DDL, or any other write access in the RDS source. Those SQL
+rights are controlled independently by the database user configured in the
+Superset connection; use a read-only RDS user such as `superset_ro`.
 If the service user currently also has `Gamma`, remove `Gamma` after verifying
 the MCP workflow so the account retains only the intended custom role.
 
