@@ -251,7 +251,10 @@ Before enabling embedding for a dashboard, configure all of the following:
    scheme/host/port origins that may frame Superset. Do not use wildcards or an
    empty allowlist. The example includes only local development origins.
 2. Configure the dashboard's own embedded settings with the same exact allowed
-   origins and record its generated embedded UUID. This is dashboard-specific.
+   origins and record its generated embedded UUID. In Superset 6.1 these must
+   be full origins including the scheme (for example,
+   `https://stage.example.com` and `http://localhost:8080`), not bare
+   `host[:port]` values. This is dashboard-specific.
 3. Create the configured `GUEST_ROLE_NAME` with only the required viewer and
    dashboard-interaction permissions. Do not use `Public`, Gamma, or Admin as
    the guest role.
@@ -376,6 +379,10 @@ PY
 Do not add `database_access`, `schema_access`, `datasource_access`, or SQL Lab
 permissions to this role. Access to an embedded dashboard and its data must be
 scoped by the short-lived guest token issued by the host application's backend.
+If this baseline works in a browser test, keep it unchanged; do not add
+`can_log` or `can_read` on `Dataset` speculatively. A `403` on the initial
+`/embedded/<uuid>` request is normally an embedded dashboard `allowed_domains`
+or Referer mismatch, not a reason to broaden the guest role.
 
 </details>
 
