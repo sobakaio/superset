@@ -19,6 +19,7 @@ superset_secret=$(openssl rand -base64 42 | tr -d '\n')
 postgres_password=$(openssl rand -hex 32)
 redis_password=$(openssl rand -hex 32)
 mcp_jwt_secret=$(openssl rand -hex 32)
+guest_token_jwt_secret=$(openssl rand -hex 32)
 admin_password=$(openssl rand -base64 24 | tr -d '\n' | tr '/+' '_-')
 
 sed \
@@ -26,6 +27,7 @@ sed \
   -e "s|__POSTGRES_PASSWORD__|${postgres_password}|" \
   -e "s|__REDIS_PASSWORD__|${redis_password}|" \
   -e "s|__MCP_JWT_SECRET__|${mcp_jwt_secret}|" \
+  -e "s|__GUEST_TOKEN_JWT_SECRET__|${guest_token_jwt_secret}|" \
   -e "s|__ADMIN_PASSWORD__|${admin_password}|" \
   .env.example > .env
 

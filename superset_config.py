@@ -142,8 +142,26 @@ FEATURE_FLAGS = {
     "ALERT_REPORT_SLACK_V2": True,
     "ALERT_REPORT_WEBHOOK": True,
     "DATE_FORMAT_IN_EMAIL_SUBJECT": True,
+    "DISABLE_EMBEDDED_SUPERSET_LOGOUT": True,
+    "EMBEDDED_SUPERSET": True,
     "PLAYWRIGHT_REPORTS_AND_THUMBNAILS": True,
 }
+
+# Dashboard embedding uses short-lived guest tokens issued by the host
+# application's backend. Keep external frame origins deployment-specific in
+# .env; the checked-in defaults are for local development only.
+EMBED_ALLOWED_ORIGINS = csv_env(
+    "SUPERSET_EMBED_ALLOWED_ORIGINS",
+    [
+        "http://localhost",
+        "http://localhost:8080",
+        "http://localhost:8081",
+        "http://localhost:8088",
+    ],
+)
+GUEST_ROLE_NAME = os.getenv("GUEST_ROLE_NAME", "Embed").strip() or "Embed"
+GUEST_TOKEN_JWT_SECRET = required_env("GUEST_TOKEN_JWT_SECRET")
+GUEST_TOKEN_JWT_EXP_SECONDS = int(os.getenv("GUEST_TOKEN_JWT_EXP_SECONDS", "300"))
 
 # MCP is a separate FastMCP process, but it loads this same Superset config.
 # Keep JWT authentication and RBAC enabled by default; disabling either is only
@@ -252,6 +270,10 @@ PREFERRED_URL_SCHEME = "https"
 TALISMAN_ENABLED = True
 TALISMAN_CONFIG = {
     **DEFAULT_TALISMAN_CONFIG,
+    "content_security_policy": {
+        **DEFAULT_TALISMAN_CONFIG["content_security_policy"],
+        "frame-ancestors": ["'self'", *EMBED_ALLOWED_ORIGINS],
+    },
     "force_https": False,
     "session_cookie_secure": SESSION_COOKIE_SECURE,
 }
