@@ -265,6 +265,13 @@ an existing deployment, generate a new independent random value and place it
 only in its protected `.env` before recreating Superset services. Guest tokens
 default to five minutes (`GUEST_TOKEN_JWT_EXP_SECONDS=300`).
 
+Superset's global CSRF protection remains enabled. The deployment exempts only
+`superset.security.api.guest_token`, because the host application's backend
+uses a JWT bearer token rather than a browser session to request a guest token.
+Do not add broader CSRF exemptions or disable CSRF globally. Restrict this
+endpoint at the reverse proxy to the host application's backend once its
+network path is known.
+
 The default `SESSION_COOKIE_SAMESITE=Lax` is intentionally retained. The
 guest-token SDK flow should not need a cross-site Superset session cookie; only
 change it after a browser test demonstrates a concrete requirement.
@@ -431,6 +438,11 @@ application's secret manager. Assign it only the
 Gamma, database access, or SQL Lab permissions. If the deployment assigns the
 `Public` role automatically, keep that role free of all data-access
 permissions.
+
+The issuer role needs only `can_grant_guest_token` on `SecurityRestApi`. Do not
+grant `can_read` merely to obtain a CSRF token: this deployment exempts only
+the backend-only guest-token endpoint from CSRF while keeping global CSRF
+protection enabled.
 
 In Superset 6.1 the issuer permission allows requesting a token for an
 existing embedded dashboard UUID; it does not restrict issuance to dashboards

@@ -7,7 +7,10 @@ from celery.schedules import crontab
 from flask_caching.backends.rediscache import RedisCache
 from redis import Redis
 from sqlalchemy.engine import URL
-from superset.config import TALISMAN_CONFIG as DEFAULT_TALISMAN_CONFIG
+from superset.config import (
+    TALISMAN_CONFIG as DEFAULT_TALISMAN_CONFIG,
+    WTF_CSRF_EXEMPT_LIST as DEFAULT_WTF_CSRF_EXEMPT_LIST,
+)
 
 
 def required_env(name: str) -> str:
@@ -263,6 +266,14 @@ SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
 
 WTF_CSRF_ENABLED = True
+# Guest tokens are requested only by the host application's backend with a
+# short-lived Superset JWT and the dedicated issuer role. Exempting this one
+# server-to-server endpoint avoids a browser-session CSRF dependency; keep all
+# Superset defaults and all other CSRF protection intact.
+WTF_CSRF_EXEMPT_LIST = [
+    *DEFAULT_WTF_CSRF_EXEMPT_LIST,
+    "superset.security.api.guest_token",
+]
 ENABLE_PROXY_FIX = env_bool("ENABLE_PROXY_FIX", True)
 PREFERRED_URL_SCHEME = "https"
 
