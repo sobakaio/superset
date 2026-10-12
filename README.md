@@ -252,8 +252,9 @@ Before enabling embedding for a dashboard, configure all of the following:
    empty allowlist. The example includes only local development origins.
 2. Configure the dashboard's own embedded settings with the same exact allowed
    origins and record its generated embedded UUID. This is dashboard-specific.
-3. Create the configured `GUEST_ROLE_NAME` with only the required dataset and
-   viewer permissions. Do not use `Public`, Gamma, or Admin as the guest role.
+3. Create the configured `GUEST_ROLE_NAME` with only the required viewer and
+   dashboard-interaction permissions. Do not use `Public`, Gamma, or Admin as
+   the guest role.
 4. Create a least-privilege service account that can request guest tokens. The
    host backend must authorize its current user and select a dashboard from a
    server-side allowlist before requesting a token. Never accept an arbitrary
@@ -434,9 +435,11 @@ permissions.
 In Superset 6.1 the issuer permission allows requesting a token for an
 existing embedded dashboard UUID; it does not restrict issuance to dashboards
 the issuer can view. Therefore the host backend must keep a server-side
-allowlist mapping every permitted embed location to its dashboard UUID and
-dataset IDs. Never accept a UUID, dataset ID, RLS clause, or token parameters
-from the browser.
+allowlist mapping every permitted embed location to its dashboard UUID. In
+Superset 6.1 guest tokens do not accept an explicit dataset allowlist: the
+guest can access only datasets actually used by charts in the authorized
+dashboard. Never accept a UUID, RLS clause, or token parameters from the
+browser.
 
 </details>
 
