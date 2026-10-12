@@ -371,6 +371,75 @@ scoped by the short-lived guest token issued by the host application's backend.
 
 </details>
 
+<details>
+<summary>Bootstrap the guest-token issuer role and service account</summary>
+
+The host application's backend, not its browser frontend, requests guest
+tokens from Superset. Create a dedicated issuer role with exactly the
+`can_grant_guest_token` permission:
+
+```bash
+cd /opt/docker/apache-superset
+
+docker compose exec -T superset-web superset shell <<'PY'
+exec(r'''
+from superset import db, security_manager
+
+ROLE_NAME = "Kaktus-Embed-Token-Issuer"
+REQUIRED = (
+    ("can_grant_guest_token", "SecurityRestApi"),
+)
+
+role = security_manager.find_role(ROLE_NAME)
+if role is None:
+    role = security_manager.add_role(ROLE_NAME)
+    db.session.flush()
+    print(f"Created role: {ROLE_NAME}")
+
+for permission_name, view_name in REQUIRED:
+    pv = security_manager.find_permission_view_menu(permission_name, view_name)
+    if pv is None:
+        raise RuntimeError(
+            f"Missing permission: {permission_name} on {view_name}. "
+            "Run `superset init` and investigate."
+        )
+
+    if pv not in role.permissions:
+        security_manager.add_permission_role(role, pv)
+        print(f"Granted: {permission_name} on {view_name}")
+    else:
+        print(f"Already present: {permission_name} on {view_name}")
+
+db.session.commit()
+
+actual = sorted(
+    (pv.permission.name, pv.view_menu.name)
+    for pv in role.permissions
+)
+print()
+print(f"Role ready: {role.name}")
+print(f"Permissions: {actual}")
+''')
+PY
+```
+
+Create a dedicated database-authenticated Superset user (for example,
+`kaktus-embed`) with a randomly generated password stored only in the host
+application's secret manager. Assign it only the
+`Kaktus-Embed-Token-Issuer` role; do not assign `Admin`, `Embed`, `Manager`,
+Gamma, database access, or SQL Lab permissions. If the deployment assigns the
+`Public` role automatically, keep that role free of all data-access
+permissions.
+
+In Superset 6.1 the issuer permission allows requesting a token for an
+existing embedded dashboard UUID; it does not restrict issuance to dashboards
+the issuer can view. Therefore the host backend must keep a server-side
+allowlist mapping every permitted embed location to its dashboard UUID and
+dataset IDs. Never accept a UUID, dataset ID, RLS clause, or token parameters
+from the browser.
+
+</details>
+
 ## MCP server
 
 The stack includes `superset-mcp` as a separate service, as required by the
