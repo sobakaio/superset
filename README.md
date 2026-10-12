@@ -268,6 +268,109 @@ The default `SESSION_COOKIE_SAMESITE=Lax` is intentionally retained. The
 guest-token SDK flow should not need a cross-site Superset session cookie; only
 change it after a browser test demonstrates a concrete requirement.
 
+<details>
+<summary>Bootstrap the Embed guest role</summary>
+
+The configured `GUEST_ROLE_NAME` needs the read-only UI and API permissions
+that Superset uses for embedded dashboards. This includes chart data requests,
+native dashboard-filter state, and time-range selectors. It does **not** grant
+direct database, schema, datasource, SQL Lab, user-management, or
+configuration access.
+
+Run this after `superset init`. It is idempotent: it creates `Embed` when
+needed and adds any absent permissions on subsequent runs. The command refuses
+to proceed if the `Public` role has direct data-access permissions, since that
+would make guest embedding unsafe. Superset installations without the optional
+annotation-layer API deliberately skip that one permission.
+
+```bash
+cd /opt/docker/apache-superset
+
+docker compose exec -T superset-web superset shell <<'PY'
+exec(r'''
+from superset import db, security_manager
+
+ROLE_NAME = "Embed"
+OPTIONAL_ABSENT = {
+    ("can_read", "AnnotationLayerRestApi"),
+}
+
+role = security_manager.find_role(ROLE_NAME)
+if role is None:
+    role = security_manager.add_role(ROLE_NAME)
+    db.session.flush()
+    print(f"Created role: {ROLE_NAME}")
+
+public_role = security_manager.find_role("Public")
+if public_role is None:
+    raise RuntimeError("Public role was not found")
+
+data_access_permissions = {
+    "database_access",
+    "schema_access",
+    "datasource_access",
+    "all_database_access",
+    "all_datasource_access",
+    "all_query_access",
+}
+
+public_data_access = sorted(
+    (pv.permission.name, pv.view_menu.name)
+    for pv in public_role.permissions
+    if pv.permission.name in data_access_permissions
+)
+if public_data_access:
+    raise RuntimeError(
+        "Public role has data-access permissions; refusing to continue: "
+        f"{public_data_access}"
+    )
+
+required = sorted(security_manager.PUBLIC_ROLE_PERMISSIONS)
+missing = [
+    (permission_name, view_name)
+    for permission_name, view_name in required
+    if security_manager.find_permission_view_menu(permission_name, view_name) is None
+]
+
+unexpected_missing = sorted(set(missing) - OPTIONAL_ABSENT)
+if unexpected_missing:
+    raise RuntimeError(
+        "Unexpected missing permissions; run `superset init` and investigate: "
+        f"{unexpected_missing}"
+    )
+
+for permission_name, view_name in required:
+    if (permission_name, view_name) in OPTIONAL_ABSENT:
+        print(
+            "Skipped unavailable optional permission: "
+            f"{permission_name} on {view_name}"
+        )
+        continue
+
+    pv = security_manager.find_permission_view_menu(permission_name, view_name)
+    if pv not in role.permissions:
+        security_manager.add_permission_role(role, pv)
+        print(f"Granted: {permission_name} on {view_name}")
+    else:
+        print(f"Already present: {permission_name} on {view_name}")
+
+db.session.commit()
+
+print()
+print(f"Role ready: {role.name}")
+print(f"Permissions: {len(role.permissions)}")
+print("Public data access: none")
+print("Range selectors and native dashboard filters: enabled")
+''')
+PY
+```
+
+Do not add `database_access`, `schema_access`, `datasource_access`, or SQL Lab
+permissions to this role. Access to an embedded dashboard and its data must be
+scoped by the short-lived guest token issued by the host application's backend.
+
+</details>
+
 ## MCP server
 
 The stack includes `superset-mcp` as a separate service, as required by the
