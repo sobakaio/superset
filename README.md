@@ -610,6 +610,143 @@ image tag in both `Dockerfile` and `docker-compose.yml`, rebuild, and let
 </details>
 
 <details>
+<summary>Bootstrap a Manager role</summary>
+
+## Manager role
+
+The following idempotent runbook creates or updates a non-administrative
+`Manager` role. It can create and edit dashboards, charts, datasets, saved
+queries, SQL Lab queries, and alerts/reports; it can use exactly one existing
+database connection but cannot administer database connections, users, roles,
+or groups. It does not remove any existing role permissions.
+
+Pass the display name of the existing Superset database connection through the
+shell environment. This value is deliberately not stored in the repository.
+
+```bash
+printf 'Existing Superset database connection name: ' >&2
+IFS= read -r DATABASE_NAME
+export DATABASE_NAME
+
+docker compose exec -T -e DATABASE_NAME superset-web superset shell <<'PY'
+import os
+
+from superset import db, security_manager
+from superset.models.core import Database
+
+ROLE_NAME = "Manager"
+DATABASE_NAME = os.getenv("DATABASE_NAME", "").strip()
+
+if not DATABASE_NAME:
+    raise RuntimeError("DATABASE_NAME must name an existing Superset connection")
+
+REQUIRED = (
+    # SQL Editor state
+    ("can_get", "TabStateView"),
+    ("can_post", "TabStateView"),
+    ("can_put", "TabStateView"),
+    ("can_activate", "TabStateView"),
+    ("can_migrate_query", "TabStateView"),
+    ("can_delete", "TabStateView"),
+    ("can_delete_query", "TabStateView"),
+    # Charts, dashboards, and datasets
+    ("can_read", "Chart"),
+    ("can_write", "Chart"),
+    ("can_read", "Dashboard"),
+    ("can_write", "Dashboard"),
+    ("can_read", "Dataset"),
+    ("can_write", "Dataset"),
+    ("can_duplicate", "Dataset"),
+    ("can_get_or_create_dataset", "Dataset"),
+    # SQL Lab and saved queries
+    ("can_read", "SQLLab"),
+    ("can_write", "SQLLab"),
+    ("can_execute_sql_query", "SQLLab"),
+    ("can_get_results", "SQLLab"),
+    ("can_read", "Query"),
+    ("can_write", "Query"),
+    ("can_read", "SavedQuery"),
+    ("can_write", "SavedQuery"),
+    # Database and datasource metadata
+    ("can_read", "Database"),
+    ("can_read", "Explore"),
+    ("can_get", "Datasource"),
+    ("can_samples", "Datasource"),
+    ("can_get_column_values", "Datasource"),
+    ("can_external_metadata", "Datasource"),
+    # Superset features
+    ("can_explore", "Superset"),
+    ("can_explore_json", "Superset"),
+    ("can_dashboard", "Superset"),
+    ("can_sqllab", "Superset"),
+    ("can_sqllab_history", "Superset"),
+    # Alerts, activity, profile, and dashboard time range
+    ("can_read", "ReportSchedule"),
+    ("can_write", "ReportSchedule"),
+    ("can_recent_activity", "Log"),
+    ("can_read", "user"),
+    ("can_time_range", "Api"),
+    ("can_this_form_get", "ResetMyPasswordView"),
+    ("can_this_form_post", "ResetMyPasswordView"),
+    ("can_this_form_get", "UserInfoEditView"),
+    ("can_this_form_post", "UserInfoEditView"),
+    ("can_userinfo", "UserDBModelView"),
+    ("resetmypassword", "UserDBModelView"),
+)
+
+MENUS = (
+    "Alerts", "Alerts & Report", "Charts", "Dashboards", "Data",
+    "Databases", "Datasets", "Manage", "Query Search", "SQL Editor",
+    "SQL Lab", "Saved Queries",
+)
+
+role = security_manager.find_role(ROLE_NAME)
+if role is None:
+    role = security_manager.add_role(ROLE_NAME)
+    db.session.flush()
+    print(f"Created role: {ROLE_NAME}")
+
+database = (
+    db.session.query(Database)
+    .filter(Database.database_name == DATABASE_NAME)
+    .one_or_none()
+)
+if database is None:
+    raise RuntimeError(f"Superset connection {DATABASE_NAME!r} was not found")
+
+def grant(permission_name, view_name):
+    pv = security_manager.find_permission_view_menu(permission_name, view_name)
+    if pv is None:
+        raise RuntimeError(
+            f"Missing Superset permission {permission_name!r} on {view_name!r}; "
+            "run `superset init` after reviewing the installed version"
+        )
+    if pv not in role.permissions:
+        security_manager.add_permission_role(role, pv)
+        print(f"Granted: {permission_name} on {view_name}")
+    else:
+        print(f"Already present: {permission_name} on {view_name}")
+
+for permission_name, view_name in REQUIRED:
+    grant(permission_name, view_name)
+for menu_name in MENUS:
+    grant("menu_access", menu_name)
+grant("database_access", database.perm)
+
+db.session.commit()
+print(f"Role ready: {role.name}; permissions: {len(role.permissions)}")
+print(f"Database access granted: {database.database_name}")
+print("No permissions were removed")
+PY
+```
+
+The script intentionally fails if a required permission is absent instead of
+creating a synthetic permission/view pair. Review the installed Superset version
+and run `superset init` separately if permissions need to be synchronized.
+
+</details>
+
+<details>
 <summary>Official references</summary>
 
 ## Official references
