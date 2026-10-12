@@ -453,6 +453,102 @@ guest can access only datasets actually used by charts in the authorized
 dashboard. Never accept a UUID, RLS clause, or token parameters from the
 browser.
 
+### Verify token issuance without exposing credentials
+
+Run this from the Docker host after creating the service account. It prompts
+for the account password without echoing it and does not print either Superset
+JWT or guest token. The request is deliberately sent to the local web service;
+do not use the public embed hostname for this smoke test.
+
+```bash
+cd /opt/docker/apache-superset
+
+read -rsp "Password for Superset user kaktus-embed: " SUPERSET_LOGIN_PASSWORD
+echo
+export SUPERSET_LOGIN_PASSWORD
+
+docker compose exec -e SUPERSET_LOGIN_PASSWORD superset-web \
+  /app/.venv/bin/python -c '
+import json
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+BASE_URL = "http://127.0.0.1:8088"
+DASHBOARD_UUID = "replace-with-embedded-dashboard-uuid"
+
+def post(path, payload, access_token=None):
+    headers = {"Content-Type": "application/json"}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    request = Request(
+        BASE_URL + path,
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            return json.loads(response.read())
+    except HTTPError as error:
+        print(f"FAILED {path}: HTTP {error.code}")
+        print(error.read().decode(errors="replace")[:500])
+        raise SystemExit(1)
+    except URLError as error:
+        print(f"FAILED {path}: {error.reason}")
+        raise SystemExit(1)
+
+login = post(
+    "/api/v1/security/login",
+    {
+        "username": "kaktus-embed",
+        "password": os.environ["SUPERSET_LOGIN_PASSWORD"],
+        "provider": "db",
+        "refresh": False,
+    },
+)
+
+access_token = login.get("access_token")
+if not access_token:
+    print("FAILED login: no access_token returned")
+    raise SystemExit(1)
+
+guest = post(
+    "/api/v1/security/guest_token/",
+    {
+        "user": {"username": "embed-smoke-test"},
+        "resources": [
+            {"type": "dashboard", "id": DASHBOARD_UUID},
+        ],
+        "rls": [],
+    },
+    access_token,
+)
+
+if not guest.get("token"):
+    print("FAILED guest-token request: no token returned")
+    raise SystemExit(1)
+
+print("Guest-token smoke test: OK")
+print("Tokens were not displayed.")
+'
+
+TEST_STATUS=$?
+unset SUPERSET_LOGIN_PASSWORD
+
+if [ "$TEST_STATUS" -eq 0 ]; then
+  echo "Smoke test completed successfully."
+else
+  echo "Smoke test failed."
+fi
+```
+
+The application backend must perform the same login and guest-token exchange,
+hold the service-account password only in its secret manager, and return only
+the resulting short-lived guest token to its authenticated frontend user.
+
 </details>
 
 ## MCP server
