@@ -279,6 +279,31 @@ The default `SESSION_COOKIE_SAMESITE=Lax` is intentionally retained. The
 guest-token SDK flow should not need a cross-site Superset session cookie; only
 change it after a browser test demonstrates a concrete requirement.
 
+### Reverse proxy and CDN boundary
+
+Use a separate embedding hostname for browser iframe traffic. Keep the primary
+Superset hostname IP-restricted for the full UI and administration. The
+embedding hostname must allow its general web routes (`/embedded/<uuid>`,
+assets, and dashboard API requests) because they are requested by the viewer's
+browser after it receives a guest token.
+
+The two issuer-only endpoints must be protected independently with exact proxy
+locations:
+
+- `/api/v1/security/login`
+- `/api/v1/security/guest_token/`
+
+Allow only the host application's production/stage backend source addresses
+and explicitly approved development VPN egress addresses; deny all other
+sources. Do not expose these endpoints to arbitrary browsers, and do not put
+the service-account password in frontend code.
+
+If a CDN/WAF is in front of the embedding hostname, it can block server-side
+HTTP clients before the request reaches the proxy. Create a narrow exception
+only for the same source-address allowlist and the two exact issuer paths (for
+example, skip Browser Integrity Check there). Do not disable bot or integrity
+protection for the whole zone or hostname.
+
 <details>
 <summary>Bootstrap the Embed guest role</summary>
 
