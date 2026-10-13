@@ -969,6 +969,9 @@ REQUIRED = (
     ("can_write", "Chart"),
     ("can_read", "Dashboard"),
     ("can_write", "Dashboard"),
+    # Lets managers enable and configure embedding for dashboards they can edit.
+    # It does not grant guest-token issuance or broader administration.
+    ("can_set_embedded", "Dashboard"),
     ("can_read", "Dataset"),
     ("can_write", "Dataset"),
     ("can_duplicate", "Dataset"),
@@ -1058,6 +1061,11 @@ PY
 The script intentionally fails if a required permission is absent instead of
 creating a synthetic permission/view pair. Review the installed Superset version
 and run `superset init` separately if permissions need to be synchronized.
+
+`can_set_embedded` on `Dashboard` is intentionally included so Managers can use
+the **Embed dashboard** action for dashboards they are allowed to edit. Guest
+token issuance remains isolated to the dedicated embedding issuer role; do not
+grant `can_grant_guest_token` to `Manager`.
 
 </details>
 
